@@ -38,10 +38,17 @@ struct LogicalPlane {
 };
 using BufferLayout = std::vector<LogicalPlane>;
 
+// Software conversion that has to be applied to a V4L2 capture buffer before it can be exposed as VA surface.
+enum class Conversion {
+    None,
+    MM21ToNV12, // MediaTek 16x32 tiled NV12 (e.g. MT8183), see convert.h
+};
+
 struct Format {
     struct {
         fourcc format;
         BufferLayout (*derive_layout)(unsigned, unsigned);
+        Conversion conversion;
     } v4l2;
     struct {
         fourcc format;
@@ -53,5 +60,16 @@ struct Format {
     } drm;
 };
 
-extern const std::array<Format, 2> formats;
+extern const std::array<Format, 3> formats;
+
+// Result of configuring the capture queue of a device for a render target format.
+struct CaptureSetup {
+    const Format* format;
+    BufferLayout linear_layout; // target layout of converted formats, otherwise empty
+    unsigned buffer_count; // buffers actually granted by the driver
+    bool cpu_cached; // whether cacheable capture buffers were asked for
+};
+
+// Layout of a linear NV12 buffer with the given pitch (in bytes) and number of luma rows.
+BufferLayout nv12_layout_with_pitch(unsigned pitch, unsigned height);
 const Format& lookup_format(fourcc v4l2_fourcc);

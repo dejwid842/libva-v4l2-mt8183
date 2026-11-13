@@ -52,11 +52,41 @@ extern "C" {
 Buffer::Buffer(VABufferType type, unsigned count, unsigned size, VASurfaceID derived_surface_id = VA_INVALID_ID)
     : type(type)
     , count(count)
-    , data(static_cast<uint8_t*>(calloc(size, count)))
+    , data(type == VAEncCodedBufferType ? nullptr : static_cast<uint8_t*>(calloc(size, count)), BufferDeleter())
     , size(size)
     , derived_surface_id(derived_surface_id)
     , info({ .handle = static_cast<uintptr_t>(-1) })
+    , coded_data(type == VAEncCodedBufferType ? static_cast<size_t>(size) * count : 0)
 {
+    if (type == VAEncCodedBufferType) {
+        coded_segment.buf = coded_data.data();
+    }
+}
+
+Buffer::Buffer(VABufferType type, unsigned count, unsigned size, uint8_t* external_data,
+    std::shared_ptr<void> keep_alive, VASurfaceID derived_surface_id, std::shared_ptr<DmaBuffer> sync_buffer)
+    : type(type)
+    , count(count)
+    , data(external_data, BufferDeleter { std::move(keep_alive) })
+    , size(size)
+    , derived_surface_id(derived_surface_id)
+    , info({ .handle = static_cast<uintptr_t>(-1) })
+    , sync_buffer(std::move(sync_buffer))
+{
+}
+
+VAStatus createExternalBuffer(VADriverContextP context, VABufferType type, unsigned int size, uint8_t* data,
+    std::shared_ptr<void> keep_alive, VASurfaceID derived_surface_id, VABufferID* buffer_id,
+    std::shared_ptr<DmaBuffer> sync_buffer)
+{
+    auto driver_data = static_cast<DriverData*>(context->pDriverData);
+
+    std::lock_guard<std::mutex> guard(driver_data->mutex);
+    *buffer_id = smallest_free_key(driver_data->buffers);
+    auto [buffer, inserted]
+        = driver_data->buffers.emplace(std::make_pair(*buffer_id,
+            Buffer(type, 1, size, data, std::move(keep_alive), derived_surface_id, std::move(sync_buffer))));
+    return inserted ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_ALLOCATION_FAILED;
 }
 
 VAStatus createBuffer(VADriverContextP context, VAContextID context_id, VABufferType type, unsigned int size,
@@ -71,16 +101,30 @@ VAStatus createBuffer(VADriverContextP context, VAContextID context_id, VABuffer
     case VASliceDataBufferType:
     case VAImageBufferType:
     case VAProbabilityBufferType:
+    case VAEncCodedBufferType:
+    case VAEncSequenceParameterBufferType:
+    case VAEncPictureParameterBufferType:
+    case VAEncSliceParameterBufferType:
+    case VAEncPackedHeaderParameterBufferType:
+    case VAEncPackedHeaderDataBufferType:
+    case VAEncMiscParameterBufferType:
+    case VAEncMacroblockParameterBufferType:
+    case VAEncMacroblockMapBufferType:
+    case VAEncQPBufferType:
         break;
 
     default:
         return VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE;
     }
 
+    if (type == VAEncCodedBufferType && data) {
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
+
     std::lock_guard<std::mutex> guard(driver_data->mutex);
     *buffer_id = smallest_free_key(driver_data->buffers);
     auto [buffer, inserted] = driver_data->buffers.emplace(std::make_pair(*buffer_id, Buffer(type, count, size)));
-    if (!inserted || !buffer->second.data) {
+    if (!inserted || (!buffer->second.data && type != VAEncCodedBufferType)) {
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
 
@@ -114,7 +158,18 @@ VAStatus mapBuffer(VADriverContextP context, VABufferID buffer_id, void** data_m
     }
 
     /* Our buffers are always mapped. */
-    *data_map = driver_data->buffers.at(buffer_id).data.get();
+    auto& buffer = driver_data->buffers.at(buffer_id);
+    if (buffer.sync_buffer && !buffer.cpu_write_mapped) {
+        try {
+            buffer.sync_buffer->begin_cpu_access_rw();
+            buffer.cpu_write_mapped = true;
+        } catch (const std::exception& e) {
+            error_log(context, "Unable to begin CPU access to surface buffer: %s\n", e.what());
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
+    }
+    *data_map = (buffer.type == VAEncCodedBufferType)
+        ? static_cast<void*>(&buffer.coded_segment) : static_cast<void*>(buffer.data.get());
 
     return VA_STATUS_SUCCESS;
 }
@@ -126,6 +181,16 @@ VAStatus unmapBuffer(VADriverContextP context, VABufferID buffer_id)
     /* Our buffers are always mapped. */
     if (!driver_data->buffers.contains(buffer_id)) {
         return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
+    auto& buffer = driver_data->buffers.at(buffer_id);
+    if (buffer.sync_buffer && buffer.cpu_write_mapped) {
+        try {
+            buffer.sync_buffer->end_cpu_access_rw();
+            buffer.cpu_write_mapped = false;
+        } catch (const std::exception& e) {
+            error_log(context, "Unable to end CPU access to surface buffer: %s\n", e.what());
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
     }
 
     return VA_STATUS_SUCCESS;
@@ -140,6 +205,20 @@ VAStatus bufferSetNumElements(VADriverContextP context, VABufferID buffer_id, un
     }
     auto& buffer = driver_data->buffers.at(buffer_id);
 
+    if (buffer.type == VAEncCodedBufferType) {
+        if (buffer.data.get_deleter().keep_alive) {
+            return VA_STATUS_ERROR_INVALID_BUFFER;
+        }
+        buffer.coded_data.resize(static_cast<size_t>(buffer.size) * count);
+        buffer.count = count;
+        buffer.coded_segment = {};
+        buffer.coded_segment.buf = buffer.coded_data.data();
+        return VA_STATUS_SUCCESS;
+    }
+
+    if (buffer.data.get_deleter().keep_alive) {
+        return VA_STATUS_ERROR_INVALID_BUFFER; // memory of someone else, can't be resized
+    }
     buffer.data.reset(static_cast<uint8_t*>(reallocarray(buffer.data.release(), buffer.size, count)));
     buffer.count = count;
 

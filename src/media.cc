@@ -56,7 +56,9 @@ void media_request_queue(int request_fd)
 
 void media_request_wait_completion(int request_fd)
 {
-    timeval tv = { 0, 300000 };
+    // The kernel gives up on a stuck decoder job after about a second, completing the request with an error.
+    // Waiting for a shorter time would only report a failure the driver hasn't even detected yet.
+    timeval tv = { 2, 0 };
     fd_set except_fds;
 
     FD_ZERO(&except_fds);

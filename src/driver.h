@@ -27,6 +27,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -46,7 +47,7 @@ extern "C" {
 class Context;
 
 #define V4L2_STR_VENDOR "v4l2"
-#define V4L2_MAX_PROFILES 11
+#define V4L2_MAX_PROFILES 16
 #define V4L2_MAX_ENTRYPOINTS 5
 #define V4L2_MAX_IMAGE_FORMATS 10
 #define V4L2_MAX_SUBPIC_FORMATS 4
@@ -61,6 +62,10 @@ struct DriverData {
     std::map<VABufferID, Buffer> buffers;
     std::map<VAImageID, VAImage> images;
     std::vector<V4L2M2MDevice> devices;
+    // FFmpeg chooses its hwupload transfer method after the first successful
+    // vaDeriveImage probe, often before it creates an encoder VAConfig.
+    // Never change the generic-surface answer mid-pool.
+    std::atomic<bool> generic_derive_succeeded { false };
     std::mutex mutex;
 };
 

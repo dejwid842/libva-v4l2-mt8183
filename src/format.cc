@@ -39,19 +39,30 @@ namespace {
 
 BufferLayout nv12_derive_layout(unsigned width, unsigned height)
 {
-    auto base_size = width * height;
-    return BufferLayout {
-        { 0, base_size, width, 0 },
-        { 0, base_size / 2, width, base_size },
-    };
+    return nv12_layout_with_pitch(width, height);
 }
 
 } // namespace
 
-const std::array<Format, 2> formats = {
-    Format { { V4L2_PIX_FMT_NV12, &nv12_derive_layout }, { VA_FOURCC_NV12, VA_RT_FORMAT_YUV420 },
+BufferLayout nv12_layout_with_pitch(unsigned pitch, unsigned height)
+{
+    const auto luma_size = pitch * height;
+    return BufferLayout {
+        { 0, luma_size, pitch, 0 },
+        { 0, pitch * ((height + 1) / 2), pitch, luma_size },
+    };
+}
+
+// Order matters: when a device offers several formats for the same render target, the first match wins.
+// Formats that can be used as is are therefore listed before those requiring a software conversion.
+const std::array<Format, 3> formats = {
+    Format { { V4L2_PIX_FMT_NV12, &nv12_derive_layout, Conversion::None }, { VA_FOURCC_NV12, VA_RT_FORMAT_YUV420 },
         { DRM_FORMAT_NV12, DRM_FORMAT_MOD_LINEAR } },
-    Format { { V4L2_PIX_FMT_NV12M, nullptr }, { VA_FOURCC_NV12, VA_RT_FORMAT_YUV420 },
+    Format { { V4L2_PIX_FMT_NV12M, nullptr, Conversion::None }, { VA_FOURCC_NV12, VA_RT_FORMAT_YUV420 },
+        { DRM_FORMAT_NV12, DRM_FORMAT_MOD_LINEAR } },
+    // The only capture format of the MediaTek MT8183 decoder (mtk-vcodec). The data is converted to linear NV12,
+    // so it is exposed to applications exactly like the other NV12 variants.
+    Format { { V4L2_PIX_FMT_MM21, nullptr, Conversion::MM21ToNV12 }, { VA_FOURCC_NV12, VA_RT_FORMAT_YUV420 },
         { DRM_FORMAT_NV12, DRM_FORMAT_MOD_LINEAR } },
 };
 

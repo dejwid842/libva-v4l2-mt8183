@@ -27,10 +27,13 @@
  */
 
 #include "h264.h"
+#include "debug.h"
 #include "linux/v4l2-controls.h"
 
 #include <cassert>
 #include <climits>
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 
@@ -134,6 +137,15 @@ h264_dpb_entry* dpb_find_entry(H264Context& context)
     if (!entry)
         entry = dpb_find_oldest_unused_entry(context);
 
+    if (!entry) {
+        // Everything is in use (more references than the DPB can hold?): take the oldest, rather than crash.
+        entry = &context.dpb.entries[0];
+        for (auto& candidate : context.dpb.entries) {
+            if (candidate.age < entry->age)
+                entry = &candidate;
+        }
+    }
+
     return entry;
 }
 
@@ -150,10 +162,10 @@ h264_dpb_entry* dpb_lookup(H264Context& context, VAPictureH264* pic, v4l2_h264_r
         if (entry->pic.picture_id == pic->picture_id) {
             if (ref) {
                 ref->index = i;
-                if (pic->flags & VA_BOTTOM_FIELD) {
+                if (pic->flags & VA_PICTURE_H264_BOTTOM_FIELD) {
                     ref->fields |= V4L2_H264_BOTTOM_FIELD_REF;
                 }
-                if (pic->flags & VA_TOP_FIELD) {
+                if (pic->flags & VA_PICTURE_H264_TOP_FIELD) {
                     ref->fields |= V4L2_H264_TOP_FIELD_REF;
                 }
             }
@@ -208,11 +220,14 @@ void dpb_update(H264Context& context, VAPictureParameterBufferH264* parameters)
         VAPictureH264* pic = &parameters->ReferenceFrames[i];
         h264_dpb_entry* entry;
 
-        if (is_picture_null(pic))
+        if (is_picture_null(pic) || (pic->flags & VA_PICTURE_H264_INVALID)
+            || pic->picture_id == parameters->CurrPic.picture_id)
             continue;
 
         entry = dpb_lookup(context, pic, NULL);
         if (entry) {
+            // Keep what is known about the picture current (e.g. it may have become a long term reference).
+            memcpy(&entry->pic, pic, sizeof(entry->pic));
             entry->age = context.dpb.age;
             entry->used = true;
         } else {
@@ -221,7 +236,8 @@ void dpb_update(H264Context& context, VAPictureParameterBufferH264* parameters)
     }
 }
 
-void h264_fill_dpb(DriverData* data, H264Context& context, v4l2_ctrl_h264_decode_params* decode)
+void h264_fill_dpb(DriverData* data, H264Context& context, v4l2_ctrl_h264_decode_params* decode,
+    VASurfaceID current_picture, unsigned current_frame_num, unsigned max_frame_num)
 {
     int i;
 
@@ -236,14 +252,38 @@ void h264_fill_dpb(DriverData* data, H264Context& context, v4l2_ctrl_h264_decode
         if (!entry->valid)
             continue;
 
-        if (surface != data->surfaces.end()) {
-            timestamp = v4l2_timeval_to_ns(&surface->second.timestamp);
-            dpb->reference_ts = timestamp;
-        }
+        // The picture being decoded is not a reference of itself: listing it would make the decoder both read
+        // and write the same buffer.
+        if (entry->pic.picture_id == current_picture)
+            continue;
+
+        // Without a surface there's no buffer (timestamp) to refer to.
+        if (surface == data->surfaces.end())
+            continue;
+
+        timestamp = v4l2_timeval_to_ns(&surface->second.timestamp);
+        dpb->reference_ts = timestamp;
 
         dpb->frame_num = entry->pic.frame_idx;
-        dpb->top_field_order_cnt = entry->pic.TopFieldOrderCnt;
-        dpb->bottom_field_order_cnt = entry->pic.BottomFieldOrderCnt;
+        dpb->top_field_order_cnt = entry->pic.TopFieldOrderCnt - context.poc_base;
+        dpb->bottom_field_order_cnt = entry->pic.BottomFieldOrderCnt - context.poc_base;
+
+        // Which fields of the entry can be referenced; decoders (and the kernel's reference list builder) rely on it,
+        // so it can't be left at 0 for ordinary frames.
+        if (entry->pic.flags & VA_PICTURE_H264_TOP_FIELD)
+            dpb->fields = V4L2_H264_TOP_FIELD_REF;
+        else if (entry->pic.flags & VA_PICTURE_H264_BOTTOM_FIELD)
+            dpb->fields = V4L2_H264_BOTTOM_FIELD_REF;
+        else
+            dpb->fields = V4L2_H264_FRAME_REF;
+
+        // PicNum of short term pictures is FrameNumWrap (7.4.3), and LongTermPicNum of long term ones is
+        // LongTermFrameIdx (both for frames, which is all that's handled here).
+        if (entry->pic.flags & VA_PICTURE_H264_LONG_TERM_REFERENCE)
+            dpb->pic_num = entry->pic.frame_idx;
+        else
+            dpb->pic_num = (entry->pic.frame_idx > current_frame_num) ? entry->pic.frame_idx - max_frame_num
+                                                                     : entry->pic.frame_idx;
 
         dpb->flags = V4L2_H264_DPB_ENTRY_FLAG_VALID;
 
@@ -255,13 +295,43 @@ void h264_fill_dpb(DriverData* data, H264Context& context, v4l2_ctrl_h264_decode
     }
 }
 
+// VA-API doesn't carry the level of the stream, but decoders (at least MediaTek's) may size their internal buffers
+// by it. Pick the lowest level that can hold the picture size and the number of reference frames.
+uint8_t h264_guess_level_idc(unsigned width_in_mbs, unsigned height_in_mbs, unsigned num_ref_frames)
+{
+    static const struct {
+        uint8_t level_idc;
+        unsigned max_frame_size_mbs;
+        unsigned max_dpb_mbs;
+    } levels[] = {
+        { 10, 99, 396 }, { 11, 396, 900 }, { 12, 396, 2376 }, { 20, 396, 2376 }, { 21, 792, 4752 },
+        { 22, 1620, 8100 }, { 30, 1620, 8100 }, { 31, 3600, 18000 }, { 32, 5120, 20480 }, { 40, 8192, 32768 },
+        { 42, 8704, 34816 }, { 50, 22080, 110400 }, { 51, 36864, 184320 },
+    };
+
+    const unsigned frame_size = width_in_mbs * height_in_mbs;
+    for (const auto& level : levels) {
+        if (frame_size <= level.max_frame_size_mbs && frame_size * num_ref_frames <= level.max_dpb_mbs)
+            return level.level_idc;
+    }
+    return 52;
+}
+
 void h264_va_picture_to_v4l2(DriverData* driver_data, H264Context& context, VAPictureParameterBufferH264* VAPicture,
     v4l2_ctrl_h264_decode_params* decode, v4l2_ctrl_h264_pps* pps, v4l2_ctrl_h264_sps* sps)
 {
-    h264_fill_dpb(driver_data, context, decode);
+    h264_fill_dpb(driver_data, context, decode, VAPicture->CurrPic.picture_id, VAPicture->frame_num,
+        1u << (VAPicture->seq_fields.bits.log2_max_frame_num_minus4 + 4));
 
-    decode->top_field_order_cnt = VAPicture->CurrPic.TopFieldOrderCnt;
-    decode->bottom_field_order_cnt = VAPicture->CurrPic.BottomFieldOrderCnt;
+    decode->frame_num = VAPicture->frame_num;
+    if (VAPicture->pic_fields.bits.field_pic_flag) {
+        decode->flags |= V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC;
+        if (VAPicture->CurrPic.flags & VA_PICTURE_H264_BOTTOM_FIELD)
+            decode->flags |= V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD;
+    }
+
+    decode->top_field_order_cnt = VAPicture->CurrPic.TopFieldOrderCnt - context.poc_base;
+    decode->bottom_field_order_cnt = VAPicture->CurrPic.BottomFieldOrderCnt - context.poc_base;
 
     pps->weighted_bipred_idc = VAPicture->pic_fields.bits.weighted_bipred_idc;
     pps->pic_init_qs_minus26 = VAPicture->pic_init_qs_minus26;
@@ -299,6 +369,8 @@ void h264_va_picture_to_v4l2(DriverData* driver_data, H264Context& context, VAPi
     sps->max_num_ref_frames = VAPicture->num_ref_frames;
     sps->pic_width_in_mbs_minus1 = VAPicture->picture_width_in_mbs_minus1;
     sps->pic_height_in_map_units_minus1 = VAPicture->picture_height_in_mbs_minus1;
+    sps->level_idc = h264_guess_level_idc(VAPicture->picture_width_in_mbs_minus1 + 1,
+        VAPicture->picture_height_in_mbs_minus1 + 1, VAPicture->num_ref_frames);
 
     if (VAPicture->seq_fields.bits.residual_colour_transform_flag)
         sps->flags |= V4L2_H264_SPS_FLAG_SEPARATE_COLOUR_PLANE;
@@ -317,15 +389,21 @@ void h264_va_picture_to_v4l2(DriverData* driver_data, H264Context& context, VAPi
 void h264_va_matrix_to_v4l2(DriverData* driver_data, const H264Context& context, VAIQMatrixBufferH264* VAMatrix,
     v4l2_ctrl_h264_scaling_matrix* v4l2_matrix)
 {
+    // Lists the stream doesn't have (VA-API only gives the luma ones for 8x8) must not be left at zero: decoders may
+    // use them regardless of what the stream says. Flat is what the kernel starts with, too.
+    memset(v4l2_matrix, 16, sizeof(*v4l2_matrix));
+
+    // 4x4: Intra Y, Intra Cb, Intra Cr, Inter Y, Inter Cb, Inter Cr, which is the order VA-API uses as well.
     memcpy(v4l2_matrix->scaling_list_4x4, &VAMatrix->ScalingList4x4, sizeof(VAMatrix->ScalingList4x4));
 
     /*
-     * In YUV422, there's only two matrices involved, while YUV444
-     * needs 6. However, in the former case, the two matrices
-     * should be placed at the 0 and 3 offsets.
+     * 8x8 has a different order (H.264 table 7-2): Intra Y, Inter Y, Intra Cb, Inter Cb, Intra Cr, Inter Cr. Only
+     * the first two are involved unless the stream is 4:4:4, and those are what VA-API gives.
+     * (Placing Inter Y at index 3, like the earlier V4L2 API wanted, leaves a zero list where decoders look for it,
+     * which wipes out the residual of every inter coded 8x8 transform block.)
      */
     memcpy(v4l2_matrix->scaling_list_8x8[0], &VAMatrix->ScalingList8x8[0], sizeof(v4l2_matrix->scaling_list_8x8[0]));
-    memcpy(v4l2_matrix->scaling_list_8x8[3], &VAMatrix->ScalingList8x8[1], sizeof(v4l2_matrix->scaling_list_8x8[3]));
+    memcpy(v4l2_matrix->scaling_list_8x8[1], &VAMatrix->ScalingList8x8[1], sizeof(v4l2_matrix->scaling_list_8x8[1]));
 }
 
 void h264_copy_pred_table(v4l2_h264_weight_factors* factors, unsigned int num_refs, int16_t luma_weight[32],
@@ -427,15 +505,21 @@ VAStatus H264Context::store_buffer(const Buffer& buffer) const
     const auto source_data = surface.source_buffer->get().mapping()[0];
     switch (buffer.type) {
     case VASliceDataBufferType:
-        if (mode == static_cast<v4l2_stateless_h264_decode_mode>(V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED)) {
-            surface.source_size_used = std::ranges::copy(std::initializer_list<uint8_t>{0, 0, 1}, source_data.data() + surface.source_size_used).out - source_data.data();
+    {
+        const bool start_code
+            = mode == static_cast<v4l2_stateless_h264_decode_mode>(V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED);
+
+        // Check first, so that nothing is ever written past the end of the buffer.
+        if (surface.source_size_used + (start_code ? 3 : 0) + buffer.size * buffer.count > source_data.size()) {
+            return VA_STATUS_ERROR_NOT_ENOUGH_BUFFER;
         }
 
-        if (surface.source_size_used + buffer.size * buffer.count > source_data.size()) {
-            return VA_STATUS_ERROR_NOT_ENOUGH_BUFFER;
+        if (start_code) {
+            surface.source_size_used = std::ranges::copy(std::initializer_list<uint8_t>{0, 0, 1}, source_data.data() + surface.source_size_used).out - source_data.data();
         }
         memcpy(source_data.data() + surface.source_size_used, buffer.data.get(), buffer.size * buffer.count);
         surface.source_size_used += buffer.size * buffer.count;
+    }
         break;
 
     case VAPictureParameterBufferType:
@@ -461,12 +545,50 @@ int H264Context::set_controls()
 {
     auto& surface = driver_data->surfaces.at(render_surface_id);
 
+    // Without these there's nothing to decode (the application, or an earlier step, failed to deliver them).
+    if (!surface.params.h264.picture || !surface.params.h264.slice || surface.source_size_used == 0) {
+        fprintf(stderr, "libva-v4l2: incomplete H.264 picture (picture parameters %p, slice parameters %p, %u bytes)\n",
+            static_cast<void*>(surface.params.h264.picture), static_cast<void*>(surface.params.h264.slice),
+            surface.source_size_used);
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
+
     v4l2_ctrl_h264_scaling_matrix matrix = {};
     v4l2_ctrl_h264_decode_params decode = {};
     v4l2_ctrl_h264_slice_params slice = {};
     v4l2_ctrl_h264_pps pps = {};
     v4l2_ctrl_h264_sps sps = {};
     h264_dpb_entry* output;
+
+    // nal_ref_idc and the IDR flag are not part of the VA-API parameters, but are in the NAL unit header, which is
+    // the first byte after the start code (if it is there).
+    uint8_t nal_header = 0;
+    {
+        const auto source = surface.source_buffer->get().mapping()[0];
+        if (surface.source_size_used > 3 && source[0] == 0 && source[1] == 0 && source[2] == 1)
+            nal_header = source[3];
+        else if (surface.source_size_used > 0)
+            nal_header = source[0];
+    }
+    const bool idr_picture = (nal_header & 0x1f) == 5;
+
+    // An IDR picture invalidates all earlier references.
+    if (idr_picture) {
+        for (auto& entry : dpb.entries)
+            dpb_clear_entry(&entry, false);
+    }
+
+    // Order counts relative to the IDR picture starting the sequence (or the first picture seen).
+    if (debug::quirk("rawpoc")) {
+        poc_base = 0;
+    } else if (idr_picture || !poc_base_valid) {
+        const auto& current = surface.params.h264.picture->CurrPic;
+        poc_base = std::min(current.TopFieldOrderCnt, current.BottomFieldOrderCnt);
+        poc_base_valid = true;
+    }
+
+    debug::dump_file("va_picture.bin", surface.params.h264.picture, sizeof(*surface.params.h264.picture));
+    debug::remember_va_picture(surface.params.h264.picture, sizeof(*surface.params.h264.picture));
 
     output = dpb_lookup(*this, &surface.params.h264.picture->CurrPic, NULL);
     if (!output)
@@ -477,10 +599,30 @@ int H264Context::set_controls()
     dpb_update(*this, surface.params.h264.picture);
 
     h264_va_picture_to_v4l2(driver_data, *this, surface.params.h264.picture, &decode, &pps, &sps);
-    h264_va_matrix_to_v4l2(driver_data, *this, surface.params.h264.matrix, &matrix);
+    if (surface.params.h264.matrix) {
+        h264_va_matrix_to_v4l2(driver_data, *this, surface.params.h264.matrix, &matrix);
+    } else {
+        // No matrices given: flat ones, which is what the stream specifies without any.
+        memset(&matrix, 16, sizeof(matrix));
+    }
+
+    // The default number of active references of the PPS is not known (VA-API doesn't pass it on), but decoders that
+    // parse the slice header themselves need it whenever the slice doesn't override it, in which case it's equal
+    // to the slice's. When the slice does override it, the value isn't looked at. So the slice's count is right either way.
+    switch (surface.params.h264.slice->slice_type % 5) {
+    case H264_SLICE_B:
+        pps.num_ref_idx_l1_default_active_minus1 = surface.params.h264.slice->num_ref_idx_l1_active_minus1;
+        [[fallthrough]];
+    case H264_SLICE_P:
+        pps.num_ref_idx_l0_default_active_minus1 = surface.params.h264.slice->num_ref_idx_l0_active_minus1;
+        break;
+    }
     h264_va_slice_to_v4l2(driver_data, *this, surface.params.h264.slice, surface.params.h264.picture, &slice);
 
     sps.profile_idc = profile;
+    decode.nal_ref_idc = (nal_header >> 5) & 3;
+    if (idr_picture)
+        decode.flags |= V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC;
     switch (surface.params.h264.slice->slice_type % 5) {
     case H264_SLICE_P:
         decode.flags |= V4L2_H264_DECODE_PARAM_FLAG_PFRAME;
@@ -489,6 +631,7 @@ int H264Context::set_controls()
         decode.flags |= V4L2_H264_DECODE_PARAM_FLAG_BFRAME;
         break;
     }
+    debug::dump_h264_controls(sps, pps, decode, slice, v4l2_timeval_to_ns(&surface.timestamp));
 
     std::vector<v4l2_ext_control> controls = {
         {
@@ -523,8 +666,11 @@ int H264Context::set_controls()
         });
     }
 
-    if (V4L2_H264_CTRL_PRED_WEIGHTS_REQUIRED(&pps, &slice)) {
-        v4l2_ctrl_h264_pred_weights weights = {};
+    // Frame based decoders (e.g. MediaTek, Rockchip, Hantro) parse the slice headers themselves, and don't
+    // implement the slice params / prediction weights controls, so they must not be set for them.
+    v4l2_ctrl_h264_pred_weights weights = {};
+    if (mode == static_cast<v4l2_stateless_h264_decode_mode>(V4L2_STATELESS_H264_DECODE_MODE_SLICE_BASED)
+        && V4L2_H264_CTRL_PRED_WEIGHTS_REQUIRED(&pps, &slice)) {
         h264_va_slice_to_predicted_weights(surface.params.h264.slice, &slice, &weights);
 
         controls.push_back({
@@ -537,6 +683,7 @@ int H264Context::set_controls()
     try {
         device.set_ext_controls(surface.request_fd, std::span(controls));
     } catch (std::runtime_error& e) {
+        fprintf(stderr, "libva-v4l2: unable to set H.264 controls: %s\n", e.what());
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 

@@ -26,8 +26,10 @@
  */
 
 #include "driver.h"
+#include "debug.h"
 
 #include <cassert>
+#include <exception>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -71,10 +73,29 @@ DriverData::DriverData(const std::vector<std::pair<std::string, std::optional<st
 }
 
 /* Set default visibility for the init function only. */
+namespace {
+
+// Exceptions must never escape through the C API of libva (that would terminate the whole application).
+template <auto F, typename = decltype(F)> struct Guarded;
+template <auto F, typename... Args> struct Guarded<F, VAStatus (*)(VADriverContextP, Args...)> {
+    static VAStatus call(VADriverContextP context, Args... args)
+    {
+        try {
+            return F(context, args...);
+        } catch (const std::exception& e) {
+            error_log(context, "Unhandled exception: %s\n", e.what());
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
+    }
+};
+
+} // namespace
+
 VAStatus __attribute__((visibility("default"))) VA_DRIVER_INIT_FUNC(VADriverContextP context);
 
 extern "C" VAStatus VA_DRIVER_INIT_FUNC(VADriverContextP context)
 {
+    debug::install_crash_handler();
 
     auto devices = V4L2M2MDevice::enumerate_devices();
 
@@ -99,55 +120,55 @@ extern "C" VAStatus VA_DRIVER_INIT_FUNC(VADriverContextP context)
     context->max_display_attributes = V4L2_MAX_DISPLAY_ATTRIBUTES;
     context->str_vendor = V4L2_STR_VENDOR;
 
-    vtable->vaTerminate = terminate;
-    vtable->vaQueryConfigEntrypoints = queryConfigEntrypoints;
-    vtable->vaQueryConfigProfiles = queryConfigProfiles;
-    vtable->vaQueryConfigEntrypoints = queryConfigEntrypoints;
-    vtable->vaQueryConfigAttributes = queryConfigAttributes;
-    vtable->vaCreateConfig = createConfig;
-    vtable->vaDestroyConfig = destroyConfig;
-    vtable->vaGetConfigAttributes = getConfigAttributes;
-    vtable->vaCreateSurfaces = createSurfaces;
-    vtable->vaCreateSurfaces2 = createSurfaces2;
-    vtable->vaDestroySurfaces = destroySurfaces;
-    vtable->vaExportSurfaceHandle = exportSurfaceHandle;
-    vtable->vaCreateContext = createContext;
-    vtable->vaDestroyContext = destroyContext;
-    vtable->vaCreateBuffer = createBuffer;
-    vtable->vaBufferSetNumElements = bufferSetNumElements;
-    vtable->vaMapBuffer = mapBuffer;
-    vtable->vaUnmapBuffer = unmapBuffer;
-    vtable->vaDestroyBuffer = destroyBuffer;
-    vtable->vaBufferInfo = bufferInfo;
-    vtable->vaAcquireBufferHandle = acquireBufferHandle;
-    vtable->vaReleaseBufferHandle = releaseBufferHandle;
-    vtable->vaBeginPicture = beginPicture;
-    vtable->vaRenderPicture = renderPicture;
-    vtable->vaEndPicture = endPicture;
-    vtable->vaSyncSurface = syncSurface;
-    vtable->vaQuerySurfaceAttributes = querySurfaceAttributes;
-    vtable->vaQuerySurfaceStatus = querySurfaceStatus;
-    vtable->vaPutSurface = putSurface;
-    vtable->vaQueryImageFormats = queryImageFormats;
-    vtable->vaCreateImage = createImage;
-    vtable->vaDeriveImage = deriveImage;
-    vtable->vaDestroyImage = destroyImage;
-    vtable->vaSetImagePalette = setImagePalette;
-    vtable->vaGetImage = getImage;
-    vtable->vaPutImage = putImage;
-    vtable->vaQuerySubpictureFormats = querySubpictureFormats;
-    vtable->vaCreateSubpicture = createSubpicture;
-    vtable->vaDestroySubpicture = destroySubpicture;
-    vtable->vaSetSubpictureImage = setSubpictureImage;
-    vtable->vaSetSubpictureChromakey = setSubpictureChromakey;
-    vtable->vaSetSubpictureGlobalAlpha = setSubpictureGlobalAlpha;
-    vtable->vaAssociateSubpicture = associateSubpicture;
-    vtable->vaDeassociateSubpicture = deassociateSubpicture;
-    vtable->vaQueryDisplayAttributes = queryDisplayAttributes;
-    vtable->vaGetDisplayAttributes = getDisplayAttributes;
-    vtable->vaSetDisplayAttributes = setDisplayAttributes;
-    vtable->vaLockSurface = lockSurface;
-    vtable->vaUnlockSurface = unlockSurface;
+    vtable->vaTerminate = Guarded<terminate>::call;
+    vtable->vaQueryConfigEntrypoints = Guarded<queryConfigEntrypoints>::call;
+    vtable->vaQueryConfigProfiles = Guarded<queryConfigProfiles>::call;
+    vtable->vaQueryConfigEntrypoints = Guarded<queryConfigEntrypoints>::call;
+    vtable->vaQueryConfigAttributes = Guarded<queryConfigAttributes>::call;
+    vtable->vaCreateConfig = Guarded<createConfig>::call;
+    vtable->vaDestroyConfig = Guarded<destroyConfig>::call;
+    vtable->vaGetConfigAttributes = Guarded<getConfigAttributes>::call;
+    vtable->vaCreateSurfaces = Guarded<createSurfaces>::call;
+    vtable->vaCreateSurfaces2 = Guarded<createSurfaces2>::call;
+    vtable->vaDestroySurfaces = Guarded<destroySurfaces>::call;
+    vtable->vaExportSurfaceHandle = Guarded<exportSurfaceHandle>::call;
+    vtable->vaCreateContext = Guarded<createContext>::call;
+    vtable->vaDestroyContext = Guarded<destroyContext>::call;
+    vtable->vaCreateBuffer = Guarded<createBuffer>::call;
+    vtable->vaBufferSetNumElements = Guarded<bufferSetNumElements>::call;
+    vtable->vaMapBuffer = Guarded<mapBuffer>::call;
+    vtable->vaUnmapBuffer = Guarded<unmapBuffer>::call;
+    vtable->vaDestroyBuffer = Guarded<destroyBuffer>::call;
+    vtable->vaBufferInfo = Guarded<bufferInfo>::call;
+    vtable->vaAcquireBufferHandle = Guarded<acquireBufferHandle>::call;
+    vtable->vaReleaseBufferHandle = Guarded<releaseBufferHandle>::call;
+    vtable->vaBeginPicture = Guarded<beginPicture>::call;
+    vtable->vaRenderPicture = Guarded<renderPicture>::call;
+    vtable->vaEndPicture = Guarded<endPicture>::call;
+    vtable->vaSyncSurface = Guarded<syncSurface>::call;
+    vtable->vaQuerySurfaceAttributes = Guarded<querySurfaceAttributes>::call;
+    vtable->vaQuerySurfaceStatus = Guarded<querySurfaceStatus>::call;
+    vtable->vaPutSurface = Guarded<putSurface>::call;
+    vtable->vaQueryImageFormats = Guarded<queryImageFormats>::call;
+    vtable->vaCreateImage = Guarded<createImage>::call;
+    vtable->vaDeriveImage = Guarded<deriveImage>::call;
+    vtable->vaDestroyImage = Guarded<destroyImage>::call;
+    vtable->vaSetImagePalette = Guarded<setImagePalette>::call;
+    vtable->vaGetImage = Guarded<getImage>::call;
+    vtable->vaPutImage = Guarded<putImage>::call;
+    vtable->vaQuerySubpictureFormats = Guarded<querySubpictureFormats>::call;
+    vtable->vaCreateSubpicture = Guarded<createSubpicture>::call;
+    vtable->vaDestroySubpicture = Guarded<destroySubpicture>::call;
+    vtable->vaSetSubpictureImage = Guarded<setSubpictureImage>::call;
+    vtable->vaSetSubpictureChromakey = Guarded<setSubpictureChromakey>::call;
+    vtable->vaSetSubpictureGlobalAlpha = Guarded<setSubpictureGlobalAlpha>::call;
+    vtable->vaAssociateSubpicture = Guarded<associateSubpicture>::call;
+    vtable->vaDeassociateSubpicture = Guarded<deassociateSubpicture>::call;
+    vtable->vaQueryDisplayAttributes = Guarded<queryDisplayAttributes>::call;
+    vtable->vaGetDisplayAttributes = Guarded<getDisplayAttributes>::call;
+    vtable->vaSetDisplayAttributes = Guarded<setDisplayAttributes>::call;
+    vtable->vaLockSurface = Guarded<lockSurface>::call;
+    vtable->vaUnlockSurface = Guarded<unlockSurface>::call;
 
     context->pDriverData = driver_data;
 

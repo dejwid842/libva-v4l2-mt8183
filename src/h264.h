@@ -68,4 +68,10 @@ public:
     uint8_t profile;
     struct h264_dpb dpb;
     v4l2_stateless_h264_decode_mode mode;
+
+    // Applications number the pictures' order counts however they like (ffmpeg starts at 65536), while only the
+    // differences mean anything, and decoders are better off with numbers like the ones in the bitstream.
+    // So they are made relative to the most recent IDR picture.
+    int poc_base = 0;
+    bool poc_base_valid = false;
 };
